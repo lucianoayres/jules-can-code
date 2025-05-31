@@ -1,0 +1,167 @@
+name: Ollama Prompt via API
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'The prompt to send to Ollama'
+        required: true
+        type: string
+      model:
+        description: 'The Ollama model to use'
+        required: false
+        default: 'llama3.2'
+        type: string
+      format:
+        description: 'The format for the response (e.g., json)'
+        required: false
+        default: 'json'
+        type: string
+      options:
+        description: 'JSON string for additional Ollama options (e.g., {"temperature": 0.8})'
+        required: false
+        default: '{}'
+        type: string
+      stream:
+        description: 'Whether to stream the response'
+        required: false
+        default: false
+        type: boolean
+      raw:
+        description: 'Whether to use raw mode'
+        required: false
+        default: false
+        type: boolean
+      keep_alive:
+        description: 'How long to keep the model loaded in memory (e.g., 5m, -1 for indefinite)'
+        required: false
+        default: '5m'
+        type: string
+jobs:
+  run_ollama_prompt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Ollama Binary Cache
+        id: cache-ollama-binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama_bin
+          key: ollama-binary-${{ runner.os }}
+          restore-keys: |
+            ollama-binary-${{ runner.os }}
+
+      - name: Install Ollama
+        run: |
+          if [ ! -f ~/.ollama_bin/ollama ]; then
+            echo "Ollama binary not found in cache. Installing..."
+            curl -fsSL https://ollama.com/install.sh | sh
+            # The official install script might place ollama in /usr/local/bin or other system path.
+            # We need to find it and move it to our cacheable directory.
+            # Common locations: /usr/local/bin/ollama, /usr/bin/ollama, /bin/ollama
+            OLLAMA_INSTALL_PATH=$(which ollama)
+            if [ -z "$OLLAMA_INSTALL_PATH" ]; then
+              echo "::error::Ollama installation failed or binary not found in expected PATH."
+              exit 1
+            fi
+            echo "Ollama installed at $OLLAMA_INSTALL_PATH"
+            mkdir -p ~/.ollama_bin
+            sudo mv $OLLAMA_INSTALL_PATH ~/.ollama_bin/ollama
+            echo "Ollama binary moved to ~/.ollama_bin/ollama"
+          else
+            echo "Ollama binary restored from cache."
+          fi
+          echo "$HOME/.ollama_bin" >> $GITHUB_PATH
+          ollama --version
+
+      - name: Set up Ollama Models Cache
+        id: cache-ollama-models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-models-${{ runner.os }}-${{ inputs.model }}
+          restore-keys: |
+            ollama-models-${{ runner.os }}-
+      - name: Start Ollama Service
+        run: |
+          ollama serve &
+          echo "Waiting for Ollama service to start..."
+          timeout_seconds=60
+          start_time=$(date +%s)
+          while ! curl -s -o /dev/null http://localhost:11434; do
+            current_time=$(date +%s)
+            elapsed_time=$((current_time - start_time))
+            if [ "$elapsed_time" -ge "$timeout_seconds" ]; then
+              echo "::error::Timeout waiting for Ollama service to start."
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Ollama service is up and running."
+
+      - name: Pull Ollama Model
+        run: |
+          ollama pull ${{ inputs.model }}
+          ollama list
+
+      - name: Construct API Payload
+        id: construct_payload
+        run: |
+          echo "Constructing API payload..."
+          # Safely parse the options JSON, ensuring it's valid
+          if ! echo "${{ inputs.options }}" | jq empty; then
+            echo "::warning::Invalid JSON provided for 'options'. Using empty object. Input was: ${{ inputs.options }}"
+            options_json="{}"
+          else
+            options_json='${{ inputs.options }}'
+          fi
+
+          # Construct the payload using jq for robustness
+          payload=$(jq -n \
+            --arg model "${{ inputs.model }}" \
+            --arg prompt "${{ inputs.prompt }}" \
+            --arg format "${{ inputs.format }}" \
+            --argjson stream ${{ inputs.stream }} \
+            --argjson raw ${{ inputs.raw }} \
+            --arg keep_alive "${{ inputs.keep_alive }}" \
+            --argjson options_override "$options_json" \
+            '{model: $model, prompt: $prompt, format: $format, stream: $stream, raw: $raw, keep_alive: $keep_alive} + $options_override')
+
+          echo "Payload:"
+          echo "$payload"
+          # Make payload available to subsequent steps
+          echo "api_payload<<EOF" >> $GITHUB_OUTPUT
+          echo "$payload" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Call Ollama API
+        id: call_api
+        run: |
+          echo "Sending request to Ollama API..."
+          response_json=$(curl -s -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d '${{ steps.construct_payload.outputs.api_payload }}')
+
+          echo "API Response:"
+          echo "$response_json"
+
+          # Make response available for the next step
+          echo "api_response<<EOF" >> $GITHUB_OUTPUT
+          echo "$response_json" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Display LLM Response
+        run: |
+          echo "LLM Response (raw):"
+          echo "${{ steps.call_api.outputs.api_response }}"
+
+          # If response is JSON and not streamed, try to pretty print
+          if [ "${{ inputs.format }}" == "json" ] && [ "${{ inputs.stream }}" == "false" ]; then
+            echo "LLM Response (pretty-printed JSON):"
+            echo "${{ steps.call_api.outputs.api_response }}" | jq .
+          fi
+        shell: bash
