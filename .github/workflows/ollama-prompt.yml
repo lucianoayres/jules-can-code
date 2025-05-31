@@ -74,7 +74,7 @@ jobs:
             echo "Ollama binary restored from cache."
           fi
           echo "$HOME/.ollama_bin" >> $GITHUB_PATH
-          ollama --version
+          $HOME/.ollama_bin/ollama --version # Ensure this line is updated
 
       - name: Set up Ollama Models Cache
         id: cache-ollama-models
@@ -86,7 +86,7 @@ jobs:
             ollama-models-${{ runner.os }}-
       - name: Start Ollama Service
         run: |
-          ollama serve &
+          $HOME/.ollama_bin/ollama serve & # Ensure this line is updated
           echo "Waiting for Ollama service to start..."
           timeout_seconds=60
           start_time=$(date +%s)
@@ -103,8 +103,8 @@ jobs:
 
       - name: Pull Ollama Model
         run: |
-          ollama pull ${{ inputs.model }}
-          ollama list
+          $HOME/.ollama_bin/ollama pull ${{ inputs.model }} # Ensure this line is updated
+          $HOME/.ollama_bin/ollama list # Ensure this line is updated
 
       - name: Construct API Payload
         id: construct_payload
