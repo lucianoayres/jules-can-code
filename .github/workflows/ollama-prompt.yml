@@ -55,26 +55,49 @@ jobs:
 
       - name: Install Ollama
         run: |
-          if [ ! -f ~/.ollama_bin/ollama ]; then
+          if [ ! -f $HOME/.ollama_bin/ollama ]; then
             echo "Ollama binary not found in cache. Installing..."
             curl -fsSL https://ollama.com/install.sh | sh
-            # The official install script might place ollama in /usr/local/bin or other system path.
-            # We need to find it and move it to our cacheable directory.
-            # Common locations: /usr/local/bin/ollama, /usr/bin/ollama, /bin/ollama
             OLLAMA_INSTALL_PATH=$(which ollama)
             if [ -z "$OLLAMA_INSTALL_PATH" ]; then
               echo "::error::Ollama installation failed or binary not found in expected PATH."
               exit 1
             fi
             echo "Ollama installed at $OLLAMA_INSTALL_PATH"
-            mkdir -p ~/.ollama_bin
-            sudo mv $OLLAMA_INSTALL_PATH ~/.ollama_bin/ollama
-            echo "Ollama binary moved to ~/.ollama_bin/ollama"
+            mkdir -p $HOME/.ollama_bin
+            sudo mv $OLLAMA_INSTALL_PATH $HOME/.ollama_bin/ollama
+            echo "Ollama binary moved to $HOME/.ollama_bin/ollama"
+            # Ensure correct ownership by the runner user
+            sudo chown runner:runner $HOME/.ollama_bin/ollama
+            echo "Ownership of $HOME/.ollama_bin/ollama set to runner:runner"
           else
             echo "Ollama binary restored from cache."
+            # It's possible the cache doesn't preserve ownership/permissions as expected by runner
+            # If $HOME/.ollama_bin/ollama exists and is owned by root, chown it.
+            if [ "$(stat -c '%U' $HOME/.ollama_bin/ollama)" = "root" ]; then
+                sudo chown runner:runner $HOME/.ollama_bin/ollama
+                echo "Ownership of cached $HOME/.ollama_bin/ollama changed to runner:runner"
+            fi
           fi
+
+          # Ensure the binary has execute permissions
+          if [ -f $HOME/.ollama_bin/ollama ]; then
+            # Ensure runner has execute permission.
+            # chmod +x might not be enough if runner doesn't own the file and only owner has x perm.
+            # However, chown above should handle ownership.
+            # Using sudo chmod +x to be absolutely sure if there are any lingering ownership issues.
+            # Or, more precisely, ensure user can execute: chmod u+x
+            chmod u+x $HOME/.ollama_bin/ollama
+            echo "Execute permissions (u+x) set on $HOME/.ollama_bin/ollama for the owner."
+          else
+            echo "::error::Ollama binary not found at $HOME/.ollama_bin/ollama to set permissions."
+            exit 1
+          fi
+
           echo "$HOME/.ollama_bin" >> $GITHUB_PATH
-          $HOME/.ollama_bin/ollama --version # Ensure this line is updated
+          echo "Listing permissions of Ollama binary before version check:"
+          ls -la $HOME/.ollama_bin/ollama
+          $HOME/.ollama_bin/ollama --version
 
       - name: Set up Ollama Models Cache
         id: cache-ollama-models
@@ -86,8 +109,14 @@ jobs:
             ollama-models-${{ runner.os }}-
       - name: Start Ollama Service
         run: |
-          $HOME/.ollama_bin/ollama serve & # Ensure this line is updated
+          echo "Preparing to start Ollama Service. Checking binary permissions:"
+          ls -la $HOME/.ollama_bin/ollama
+          echo "Ensuring execute permissions again just in case..."
+          chmod u+x $HOME/.ollama_bin/ollama
+          
+          $HOME/.ollama_bin/ollama serve &
           echo "Waiting for Ollama service to start..."
+          # Timeout logic remains the same
           timeout_seconds=60
           start_time=$(date +%s)
           while ! curl -s -o /dev/null http://localhost:11434; do
@@ -95,6 +124,19 @@ jobs:
             elapsed_time=$((current_time - start_time))
             if [ "$elapsed_time" -ge "$timeout_seconds" ]; then
               echo "::error::Timeout waiting for Ollama service to start."
+              # Attempt to capture Ollama service logs if it failed to start
+              if pgrep -x "ollama" > /dev/null; then
+                echo "Ollama process is running. Logs (if any via journalctl, may need sudo or be unavailable):"
+                # sudo journalctl -u ollama --no-pager -n 50 # This might not work due to permissions or how ollama logs without systemd service properly configured by script
+              else
+                echo "Ollama process is not running."
+              fi
+              # Check for any ollama log files if they exist in a known location (speculative)
+              if [ -d "$HOME/.ollama/logs" ]; then
+                 echo "Checking for logs in $HOME/.ollama/logs:"
+                 ls -la $HOME/.ollama/logs
+                 cat $HOME/.ollama/logs/* 2>/dev/null || echo "No logs found or accessible in $HOME/.ollama/logs"
+              fi
               exit 1
             fi
             sleep 1
@@ -111,10 +153,14 @@ jobs:
         run: |
           echo "Constructing API payload..."
           # Safely parse the options JSON, ensuring it's valid
-          if ! echo "${{ inputs.options }}" | jq empty; then
-            echo "::warning::Invalid JSON provided for 'options'. Using empty object. Input was: ${{ inputs.options }}"
+          if [ -z "${{ inputs.options }}" ]; then
+            echo "::debug::'options' input is empty. Defaulting to empty JSON object."
+            options_json="{}"
+          elif ! echo "${{ inputs.options }}" | jq -e empty > /dev/null 2>&1; then
+            echo "::warning::Invalid JSON provided for 'options'. Defaulting to empty JSON object. Input was: ${{ inputs.options }}"
             options_json="{}"
           else
+            echo "::debug::'options' input is valid JSON."
             options_json='${{ inputs.options }}'
           fi
 
